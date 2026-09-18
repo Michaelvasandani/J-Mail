@@ -65,8 +65,8 @@ function metadataToRow(accountId: number, msg: gmail_v1.Schema$Message) {
   };
 }
 
-async function fetchAndUpsert(gmail: gmail_v1.Gmail, accountId: number, ids: string[]) {
-  if (ids.length === 0) return 0;
+async function fetchAndUpsert(gmail: gmail_v1.Gmail, accountId: number, ids: string[]): Promise<number[]> {
+  if (ids.length === 0) return [];
   const rows = await mapLimit(ids, CONCURRENCY, async (id) => {
     try {
       const { data } = await gmail.users.messages.get({
@@ -82,8 +82,8 @@ async function fetchAndUpsert(gmail: gmail_v1.Gmail, accountId: number, ids: str
     }
   });
   const valid = rows.filter((r): r is NonNullable<typeof r> => r !== null);
-  if (valid.length === 0) return 0;
-  await db
+  if (valid.length === 0) return [];
+  const inserted = await db
     .insert(messages)
     .values(valid)
     .onConflictDoUpdate({
@@ -94,8 +94,9 @@ async function fetchAndUpsert(gmail: gmail_v1.Gmail, accountId: number, ids: str
         snippet: sql`excluded.snippet`,
         subject: sql`excluded.subject`,
       },
-    });
-  return valid.length;
+    })
+    .returning({ id: messages.id });
+  return inserted.map((r) => r.id);
 }
 
 async function fullSync(gmail: gmail_v1.Gmail, account: Account) {
@@ -113,8 +114,8 @@ async function fullSync(gmail: gmail_v1.Gmail, account: Account) {
     if (!pageToken) break;
   }
   const { data: profile } = await gmail.users.getProfile({ userId: "me" });
-  const added = await fetchAndUpsert(gmail, account.id, ids);
-  return { added, historyId: profile.historyId ?? null, mode: "full" as const };
+  const addedIds = await fetchAndUpsert(gmail, account.id, ids);
+  return { added: addedIds.length, addedIds, historyId: profile.historyId ?? null, mode: "full" as const };
 }
 
 async function incrementalSync(gmail: gmail_v1.Gmail, account: Account, startHistoryId: string) {
@@ -166,8 +167,8 @@ async function incrementalSync(gmail: gmail_v1.Gmail, account: Account, startHis
       .set({ unread })
       .where(and(eq(messages.accountId, account.id), eq(messages.gmailId, gmailId)));
   }
-  const added = await fetchAndUpsert(gmail, account.id, [...addedIds]);
-  return { added, historyId: latestHistoryId, mode: "incremental" as const };
+  const upsertedIds = await fetchAndUpsert(gmail, account.id, [...addedIds]);
+  return { added: upsertedIds.length, addedIds: upsertedIds, historyId: latestHistoryId, mode: "incremental" as const };
 }
 
 export async function syncAccount(account: Account) {
