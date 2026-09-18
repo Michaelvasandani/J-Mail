@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   boolean,
   index,
@@ -9,6 +10,7 @@ import {
   text,
   timestamp,
   uniqueIndex,
+  vector,
 } from "drizzle-orm/pg-core";
 
 export const accounts = pgTable("accounts", {
@@ -52,7 +54,8 @@ export const messages = pgTable(
     bodyText: text("body_text"),
     bodyFetchedAt: timestamp("body_fetched_at", { withTimezone: true }),
     attachments: jsonb("attachments").$type<AttachmentMeta[]>().notNull().default([]),
-    // Future: embedding vector(1536) for semantic search (pgvector extension is enabled).
+    // Set when the message has been chunked + embedded into message_chunks (see src/lib/rag/indexer.ts).
+    embeddedAt: timestamp("embedded_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
@@ -89,6 +92,33 @@ export const messageTriage = pgTable(
   (t) => [index("message_triage_category_idx").on(t.category)],
 );
 
+// Embedding vector size. Must match the model in src/lib/rag/embeddings.ts; changing it requires a re-index.
+export const EMBEDDING_DIMENSIONS = 1024;
+
+// One row per chunk of a message: metadata header + (part of) the cleaned body, embedded for semantic
+// search, plus a tsvector for keyword search. A message owns 1..n chunks. See src/lib/rag/chunk.ts.
+export const messageChunks = pgTable(
+  "message_chunks",
+  {
+    id: serial("id").primaryKey(),
+    messageId: integer("message_id")
+      .notNull()
+      .references(() => messages.id, { onDelete: "cascade" }),
+    chunkIndex: integer("chunk_index").notNull(),
+    // The exact text that was embedded (header + body slice).
+    content: text("content").notNull(),
+    embedding: vector("embedding", { dimensions: EMBEDDING_DIMENSIONS }).notNull(),
+    model: text("model").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("message_chunks_message_idx").on(t.messageId, t.chunkIndex),
+    index("message_chunks_embedding_idx").using("hnsw", t.embedding.op("vector_cosine_ops")),
+    index("message_chunks_fts_idx").using("gin", sql`to_tsvector('english', ${t.content})`),
+  ],
+);
+
 export type Account = typeof accounts.$inferSelect;
 export type Message = typeof messages.$inferSelect;
 export type MessageTriage = typeof messageTriage.$inferSelect;
+export type MessageChunk = typeof messageChunks.$inferSelect;

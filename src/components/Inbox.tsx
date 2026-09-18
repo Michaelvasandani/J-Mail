@@ -1,6 +1,7 @@
 "use client";
 
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { Chat } from "./Chat";
 
 type Account = { id: number; email: string; color: string; lastSyncedAt: string | null };
 type Triage = {
@@ -35,6 +36,7 @@ type Detail = Row & {
 type SyncReport = {
   accounts: { email: string; ok: boolean; added?: number; mode?: string; error?: string }[];
   triage: { enabled: boolean; triaged: number; failed: number; error?: string };
+  index: { embedded: number; chunks: number; failed: number; error?: string };
 };
 
 // Display metadata for triage labels. Keys mirror src/lib/triage.ts.
@@ -152,6 +154,7 @@ export function Inbox() {
   const [syncing, setSyncing] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [chatOpen, setChatOpen] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
   const loadAccounts = useCallback(async () => {
@@ -211,9 +214,12 @@ export function Inbox() {
       const triageNote = !t.enabled
         ? "triage off (no TYPESAFE_API_KEY)"
         : `${t.triaged} labeled${t.failed ? `, ${t.failed} failed` : ""}`;
-      setStatus(`Synced ${ok.length} account${ok.length === 1 ? "" : "s"}, ${added} new message${added === 1 ? "" : "s"}, ${triageNote}`);
+      const ix = report.index;
+      const indexNote = ix.error ? "indexing failed" : `${ix.embedded} indexed`;
+      setStatus(`Synced ${ok.length} account${ok.length === 1 ? "" : "s"}, ${added} new message${added === 1 ? "" : "s"}, ${triageNote}, ${indexNote}`);
       const problems = bad.map((b) => `${b.email}: ${b.error}`);
       if (t.error) problems.push(`triage: ${t.error}`);
+      if (ix.error) problems.push(`index: ${ix.error}`);
       if (problems.length) setError(problems.join(" · "));
       await loadAccounts();
       loadMessages();
@@ -295,6 +301,16 @@ export function Inbox() {
       <aside className="flex w-64 shrink-0 flex-col border-r border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
         <div className="flex items-center justify-between px-4 py-3">
           <h1 className="text-lg font-semibold tracking-tight">J-Mail</h1>
+          <div className="flex items-center gap-1">
+          <button
+            onClick={() => setChatOpen((o) => !o)}
+            title="Ask your inbox a question"
+            className={`rounded-md border px-2 py-1 text-xs font-medium ${
+              chatOpen ? "border-blue-600 bg-blue-600 text-white" : "border-zinc-300 hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+            }`}
+          >
+            Ask
+          </button>
           <button
             onClick={sync}
             disabled={syncing || accounts.length === 0}
@@ -302,6 +318,7 @@ export function Inbox() {
           >
             {syncing ? "Syncing…" : "Sync"}
           </button>
+          </div>
         </div>
 
         <nav className="flex-1 overflow-y-auto px-2">
@@ -502,6 +519,8 @@ export function Inbox() {
           </>
         )}
       </main>
+
+      {chatOpen && <Chat accountId={selectedAccount} onOpenMessage={openMessage} onClose={() => setChatOpen(false)} />}
     </div>
   );
 }
