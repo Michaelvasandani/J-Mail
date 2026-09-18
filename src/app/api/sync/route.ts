@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { accounts, db } from "@/db";
 import { syncAccount } from "@/lib/gmail";
+import { indexMessages } from "@/lib/rag/indexer";
 import { triageEnabled, triageMessages } from "@/lib/triage";
 
 export const maxDuration = 300;
@@ -29,5 +30,14 @@ export async function POST() {
     }
   }
 
-  return NextResponse.json({ accounts: report, triage });
+  // Chunk + embed new messages (plus a bounded backfill) for the inbox chat. Runs after triage so
+  // the chunk header can include the category.
+  let index: { embedded: number; chunks: number; failed: number; error?: string } = { embedded: 0, chunks: 0, failed: 0 };
+  try {
+    index = { ...index, ...(await indexMessages(newIds)) };
+  } catch (err) {
+    index.error = String((err as Error)?.message ?? err);
+  }
+
+  return NextResponse.json({ accounts: report, triage, index });
 }
