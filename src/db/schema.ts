@@ -4,6 +4,7 @@ import {
   integer,
   jsonb,
   pgTable,
+  real,
   serial,
   text,
   timestamp,
@@ -61,5 +62,33 @@ export const messages = pgTable(
   ],
 );
 
+// Triage labels produced by TypeSafe (Jev) at sync time. See src/lib/triage.ts.
+// The option keys are defined once in the triage module and stored as text here.
+export const messageTriage = pgTable(
+  "message_triage",
+  {
+    messageId: integer("message_id")
+      .primaryKey()
+      .references(() => messages.id, { onDelete: "cascade" }),
+    // Choice: what kind of message this is (newsletter, transactional, job_update, ...)
+    category: text("category").notNull(),
+    categoryConfidence: real("category_confidence").notNull(),
+    // Choice: only meaningful when category === "job_update"; null otherwise.
+    jobOutcome: text("job_outcome"),
+    jobOutcomeConfidence: real("job_outcome_confidence"),
+    // Nouls: probability (0..1) that each condition holds. Thresholds live in code.
+    needsReply: real("needs_reply").notNull(),
+    hasDeadline: real("has_deadline").notNull(),
+    fromHuman: real("from_human").notNull(),
+    moneyOwed: real("money_owed").notNull(),
+    // Full per-option probability distributions so policy can change without re-inference.
+    probabilities: jsonb("probabilities").$type<Record<string, Record<string, number>>>().notNull(),
+    model: text("model").notNull(),
+    triagedAt: timestamp("triaged_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("message_triage_category_idx").on(t.category)],
+);
+
 export type Account = typeof accounts.$inferSelect;
 export type Message = typeof messages.$inferSelect;
+export type MessageTriage = typeof messageTriage.$inferSelect;

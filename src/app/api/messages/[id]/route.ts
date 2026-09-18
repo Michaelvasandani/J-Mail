@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { eq } from "drizzle-orm";
-import { accounts, db, messages } from "@/db";
+import { accounts, db, messageTriage, messages } from "@/db";
 import { fetchMessageBody } from "@/lib/gmail";
 
 export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
@@ -12,6 +12,8 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
   if (!row) return NextResponse.json({ error: "not found" }, { status: 404 });
   const account = await db.query.accounts.findFirst({ where: eq(accounts.id, row.accountId) });
   if (!account) return NextResponse.json({ error: "account missing" }, { status: 404 });
+
+  const triage = (await db.query.messageTriage.findFirst({ where: eq(messageTriage.messageId, row.id) })) ?? null;
 
   let body = { bodyHtml: row.bodyHtml, bodyText: row.bodyText, attachments: row.attachments };
   if (!row.bodyFetchedAt) body = await fetchMessageBody(account, row.gmailId);
@@ -26,6 +28,7 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
     subject: row.subject,
     date: row.date,
     unread: row.unread,
+    triage,
     ...body,
   });
 }

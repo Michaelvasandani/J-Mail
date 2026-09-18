@@ -12,6 +12,7 @@
     "db:studio": "drizzle-kit studio"
   },
   "dependencies": {
+    "@typesafe-ai/sdk": "^0.6.0",
     "drizzle-orm": "^0.45.2",
     "googleapis": "^181.0.0",
     "next": "16.3.5",
