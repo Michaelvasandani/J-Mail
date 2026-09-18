@@ -2,23 +2,24 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-type Source = {
-  index: number;
-  messageId: number;
+type EmailMeta = {
+  id: number;
   subject: string | null;
   fromName: string | null;
   fromEmail: string | null;
   date: string;
   accountEmail: string;
   accountColor: string;
-  score: number;
-  relevance?: number;
 };
+type ToolCall = { name: string; input: Record<string, unknown> };
 type Turn = {
   role: "user" | "assistant";
   content: string;
-  sources?: Source[];
-  /** Document indexes the model actually cited, in order of first citation. */
+  /** Tool calls Claude made while answering, in order. */
+  tools?: ToolCall[];
+  /** Every email a tool surfaced, keyed by id. */
+  emails?: Record<number, EmailMeta>;
+  /** Email ids the answer cited, in order of first citation. */
   cited?: number[];
   error?: string;
 };
@@ -112,10 +113,12 @@ export function Chat({
             buf = buf.slice(nl + 1);
             if (!raw.trim()) continue;
             const ev = JSON.parse(raw);
-            if (ev.type === "sources") update((t) => ({ ...t, sources: ev.sources }));
+            if (ev.type === "tool_call") update((t) => ({ ...t, tools: [...(t.tools ?? []), { name: ev.name, input: ev.input }] }));
+            else if (ev.type === "emails")
+              update((t) => ({ ...t, emails: { ...(t.emails ?? {}), ...Object.fromEntries((ev.emails as EmailMeta[]).map((e) => [e.id, e])) } }));
             else if (ev.type === "text") update((t) => ({ ...t, content: t.content + ev.text }));
             else if (ev.type === "citation")
-              update((t) => (t.cited?.includes(ev.documentIndex) ? t : { ...t, cited: [...(t.cited ?? []), ev.documentIndex] }));
+              update((t) => (t.cited?.includes(ev.messageId) ? t : { ...t, cited: [...(t.cited ?? []), ev.messageId] }));
             else if (ev.type === "error") update((t) => ({ ...t, error: ev.error }));
           }
         }
@@ -190,25 +193,40 @@ export function Chat({
             </div>
           ) : (
             <div key={i} className="space-y-2">
-              {t.sources && t.sources.length > 0 && (
-                <div className="flex flex-wrap gap-1">
-                  {(t.cited?.length ? t.cited.map((c) => t.sources![c]).filter(Boolean) : t.sources.slice(0, 4)).map((s) => (
-                    <button
-                      key={s.messageId}
-                      onClick={() => onOpenMessage(s.messageId)}
-                      title={`${s.fromName ?? s.fromEmail ?? ""} · ${new Date(s.date).toLocaleDateString()} · ${s.accountEmail}${
-                        s.relevance !== undefined ? ` · relevance ${Math.round(s.relevance * 100)}%` : ""
-                      }`}
-                      className="inline-flex max-w-full items-center gap-1 rounded-full border border-zinc-200 bg-zinc-50 px-2 py-0.5 text-[11px] hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:hover:bg-zinc-700"
-                    >
-                      <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: s.accountColor }} />
-                      <span className="truncate">{s.subject || "(no subject)"}</span>
-                    </button>
+              {t.tools && t.tools.length > 0 && (
+                <div className="space-y-0.5">
+                  {t.tools.map((c, j) => (
+                    <div key={j} className="truncate font-mono text-[11px] text-zinc-500" title={JSON.stringify(c.input, null, 1)}>
+                      {c.name}
+                      {"("}
+                      {Object.entries(c.input)
+                        .map(([k, v]) => `${k}=${Array.isArray(v) ? v.join("|") : String(v)}`)
+                        .join(", ")}
+                      {")"}
+                    </div>
                   ))}
                 </div>
               )}
+              {t.cited && t.cited.length > 0 && t.emails && (
+                <div className="flex flex-wrap gap-1">
+                  {t.cited
+                    .map((id) => t.emails![id])
+                    .filter(Boolean)
+                    .map((s) => (
+                      <button
+                        key={s.id}
+                        onClick={() => onOpenMessage(s.id)}
+                        title={`${s.fromName ?? s.fromEmail ?? ""} · ${new Date(s.date).toLocaleDateString()} · ${s.accountEmail}`}
+                        className="inline-flex max-w-full items-center gap-1 rounded-full border border-zinc-200 bg-zinc-50 px-2 py-0.5 text-[11px] hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:hover:bg-zinc-700"
+                      >
+                        <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: s.accountColor }} />
+                        <span className="truncate">{s.subject || "(no subject)"}</span>
+                      </button>
+                    ))}
+                </div>
+              )}
               <div className="whitespace-pre-wrap rounded-lg bg-zinc-100 px-3 py-2 text-sm dark:bg-zinc-800">
-                {t.content || (busy && i === turns.length - 1 ? <span className="text-zinc-400">{t.sources ? "Thinking…" : "Searching your inbox…"}</span> : null)}
+                {t.content || (busy && i === turns.length - 1 ? <span className="text-zinc-400">{t.tools?.length ? "Reading results…" : "Looking through your inbox…"}</span> : null)}
               </div>
               {t.error && <div className="text-xs text-red-600 dark:text-red-400">{t.error}</div>}
             </div>

@@ -75,14 +75,25 @@ Open <http://localhost:3000>, click **Add Gmail account**, sign in, repeat for e
 
 ## Ask your inbox (RAG)
 
-Click **Ask** in the sidebar. Questions run through:
+Click **Ask** in the sidebar. Claude answers with tools, so it can both count and read:
 
-1. **Index** (runs inside Sync, or via **Index more** in the panel): each message's body is fetched from Gmail if needed, cleaned (HTML stripped, quoted replies and signatures dropped), and turned into one chunk of `header + body`. The header carries account, sender, date, subject, and triage category so short questions like "the Stripe invoice from March" match on metadata. Bodies over ~1.5K tokens are split on paragraphs, each piece repeating the header. Chunks live in `message_chunks` with a 1024-dim vector (HNSW, cosine) and a full-text index.
-2. **Retrieve**: pgvector top-30 and Postgres `websearch_to_tsquery` top-30 are fused with reciprocal rank fusion and grouped per message.
-3. **Rerank**: the top 20 messages are scored against the question by a cross-encoder. Default is `mixedbread-ai/mxbai-rerank-base-v1` running on-device through Transformers.js (downloaded from Hugging Face on first use, ~150 MB). Set `RERANKER=voyage` for Voyage `rerank-2.5`, or `RERANKER=none` to skip.
-4. **Answer**: the top 8 emails are sent to Claude as documents with citations enabled; the answer streams back and the cited emails appear as chips you can click to open them.
+| Tool | Backed by | Used for |
+| --- | --- | --- |
+| `list_emails` | SQL over `messages` + `message_triage` (sender, subject, date range, account, category, job outcome, flags, sort, limit; returns total count) | "how many", "latest", time windows, anything a label answers |
+| `search_emails` | Hybrid retrieval: pgvector cosine top-30 + Postgres `websearch_to_tsquery` top-30, reciprocal rank fusion, then a cross-encoder rerank of the top 20 | "what did X say about Y" |
+| `read_email` | Full cleaned body (fetched from Gmail if needed) | when a preview or passage is not enough |
 
-Embedding provider, reranker, and models are configured in `.env.local` (`EMBEDDING_PROVIDER`, `OLLAMA_EMBEDDING_MODEL`, `RERANKER`, `VOYAGE_*`). After changing them, re-embed everything:
+Every tool returns `search_result` blocks, so the answer carries citations back to email ids; the panel shows the tool calls that ran and chips for the cited emails (click to open).
+
+**Index** (runs inside Sync, or via **Index more** in the panel): each message's body is fetched from Gmail if needed, cleaned (HTML stripped, quoted replies and signatures dropped, link and boilerplate lines removed), and turned into one chunk of `header + body`. The header carries account, sender, date, subject, and triage category so short questions like "the Stripe invoice from March" match on metadata. Bodies over ~1.5K tokens are split on paragraphs, each piece repeating the header. Chunks live in `message_chunks` with a 1024-dim vector (HNSW, cosine) and a full-text index. Sync embeds every new message plus up to 150 older unembedded ones per run.
+
+**Models** (all configurable in `.env.local`):
+
+- Embeddings: `qwen3-embedding:0.6b` through Ollama by default (`EMBEDDING_PROVIDER=ollama`), or Voyage `voyage-4-large` (`EMBEDDING_PROVIDER=voyage` + `VOYAGE_API_KEY`).
+- Reranker: `mixedbread-ai/mxbai-rerank-base-v1` on-device through Transformers.js by default (`RERANKER=local`; ~150 MB download on first use), Voyage `rerank-2.5` (`RERANKER=voyage`), or `RERANKER=none`.
+- Answers: `claude-opus-5` (`CHAT_MODEL`), streaming, with the server-side refusal fallback enabled.
+
+After changing the embedding model or chunking, re-embed everything:
 
 ```bash
 curl -X POST 'http://localhost:3000/api/index?reset=1'

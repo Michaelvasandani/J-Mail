@@ -1,55 +1,42 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { NextRequest } from "next/server";
-import { getReranker } from "@/lib/rag/rerank";
-import { searchInbox, type Candidate } from "@/lib/rag/search";
+import { accounts, db } from "@/db";
+import { labelGuide, makeTools, parseEmailSource, type EmailMeta } from "@/lib/rag/tools";
 
 export const maxDuration = 300;
 
 const MODEL = process.env.CHAT_MODEL ?? "claude-opus-5";
-const TOP_K = 8;
+const MAX_ITERATIONS = 8;
 
 type ChatMessage = { role: "user" | "assistant"; content: string };
 type Body = { messages: ChatMessage[]; accountId?: number | null };
 
-export type Source = {
-  index: number;
-  messageId: number;
-  subject: string | null;
-  fromName: string | null;
-  fromEmail: string | null;
-  date: string;
-  accountEmail: string;
-  accountColor: string;
-  score: number;
-  relevance?: number;
-};
+/**
+ * Streamed NDJSON events:
+ *   {type:"tool_call", name, input}      Claude invoked a tool
+ *   {type:"emails", emails: EmailMeta[]} emails a tool surfaced (for citation chips)
+ *   {type:"text", text}                  answer text delta
+ *   {type:"citation", messageId}         the current sentence cites this email
+ *   {type:"error", error} | {type:"done"}
+ */
 
-const SYSTEM = `You are an assistant that answers questions about the user's own email inbox.
-The user's emails that may be relevant are attached as documents; each document is one email with its headers (account, sender, date, subject, category) followed by the body. Today's date is {{today}}.
+function systemPrompt(accountList: string[], scope: string | null) {
+  return `You are an assistant that answers questions about the user's own Gmail inbox using tools. Today's date is ${new Date().toISOString().slice(0, 10)}.
+Connected accounts: ${accountList.join(", ")}.${scope ? `\nThe user is currently viewing only ${scope}; restrict tools to that account unless they ask otherwise.` : ""}
 
-Answer from the documents. Cite the emails you rely on. Quote dates, amounts, names, and deadlines exactly as they appear. If the documents do not contain the answer, say so plainly and suggest how the user might rephrase; never guess or invent email content. When several emails are relevant, summarize them in date order. Keep answers concise and direct.
+Choosing tools:
+- list_emails for anything about counts, "how many", "latest"/"last"/"most recent", time windows ("last 3 days", "this week", "in August"), or a label (job applications, bills, invites, security alerts). Compute dates from today's date. For "did I apply to X" or "how many applications", use category=job_update; application confirmations are job_outcome=application_received. If a label may be missing on fresh mail, also try a sender or subject filter.
+- search_emails for questions about what an email says.
+- read_email when a preview or passage is not enough to answer precisely.
+Call several tools when needed, and prefer one more tool call over guessing.
 
-Write plain text: the reply is shown verbatim, so do not use markdown (no **bold**, no # headings, no tables). For lists, start lines with "- ".`;
+${labelGuide()}
 
-function line(obj: unknown) {
-  return JSON.stringify(obj) + "\n";
-}
-
-// Follow-up questions ("when was that?") retrieve poorly on their own; fold in the previous user turn.
-function retrievalQuery(messages: ChatMessage[]) {
-  const users = messages.filter((m) => m.role === "user").map((m) => m.content.trim());
-  const last = users[users.length - 1] ?? "";
-  const prev = users[users.length - 2];
-  return last.split(/\s+/).length < 5 && prev ? `${prev} ${last}` : last;
-}
-
-function documentBlock(c: Candidate, i: number): Anthropic.Beta.BetaContentBlockParam {
-  return {
-    type: "document",
-    source: { type: "text", media_type: "text/plain", data: c.chunks.map((ch) => ch.content).join("\n\n[...]\n\n") },
-    title: `Email ${i + 1}: ${c.subject ?? "(no subject)"} — from ${c.fromName ?? c.fromEmail ?? "unknown"} on ${c.date.toISOString().slice(0, 10)}`,
-    citations: { enabled: true },
-  };
+Answering:
+- Answer from the tool results only. Cite the emails you rely on. Quote dates, amounts, names, and deadlines exactly.
+- If nothing matches, say so and suggest a rephrasing; never invent email content.
+- List multiple emails in date order. Be concise.
+- Plain text only: the reply is shown verbatim. No markdown, no **bold**, no headings. For lists start lines with "- ".`;
 }
 
 export async function POST(req: NextRequest) {
@@ -62,67 +49,70 @@ export async function POST(req: NextRequest) {
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      const send = (obj: unknown) => controller.enqueue(encoder.encode(line(obj)));
+      const send = (obj: unknown) => controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
       try {
-        const question = retrievalQuery(messages);
-        const candidates = await searchInbox(question, { accountId: body.accountId ?? null }, TOP_K);
-        const sources: Source[] = candidates.map((c, i) => ({
-          index: i,
-          messageId: c.messageId,
-          subject: c.subject,
-          fromName: c.fromName,
-          fromEmail: c.fromEmail,
-          date: c.date.toISOString(),
-          accountEmail: c.accountEmail,
-          accountColor: c.accountColor,
-          score: c.score,
-          relevance: c.relevance,
-        }));
-        send({ type: "sources", sources, reranker: getReranker()?.name ?? null });
-
-        if (candidates.length === 0) {
-          send({ type: "text", text: "I couldn't find any emails related to that. Make sure the inbox has been synced and indexed, or try different words." });
-          send({ type: "done" });
-          controller.close();
-          return;
-        }
-
         if (!process.env.ANTHROPIC_API_KEY?.trim()) {
-          send({ type: "error", error: "Found matching emails, but answering needs ANTHROPIC_API_KEY in .env.local (restart the dev server after adding it)." });
+          send({ type: "error", error: "Answering needs ANTHROPIC_API_KEY in .env.local (restart the dev server after adding it)." });
           return;
         }
-        const client = new Anthropic();
-        const history: Anthropic.Beta.BetaMessageParam[] = messages.slice(0, -1).map((m) => ({ role: m.role, content: m.content }));
-        const last = messages[messages.length - 1];
-        const finalTurn: Anthropic.Beta.BetaMessageParam = {
-          role: "user",
-          content: [...candidates.map(documentBlock), { type: "text", text: last.content }],
-        };
+        const all = await db.select({ id: accounts.id, email: accounts.email }).from(accounts);
+        const scope = body.accountId ? all.find((a) => a.id === body.accountId)?.email ?? null : null;
 
-        const claude = client.beta.messages.stream({
-          model: MODEL,
-          max_tokens: 8000,
-          system: SYSTEM.replace("{{today}}", new Date().toISOString().slice(0, 10)),
-          messages: [...history, finalTurn],
-          output_config: { effort: "medium" },
-          // Route policy declines to a fallback model inside the same request instead of returning nothing.
-          betas: ["server-side-fallback-2026-07-01"],
-          fallbacks: "default",
+        const seen = new Map<number, EmailMeta>();
+        const tools = makeTools({
+          onEmails(emails) {
+            const fresh = emails.filter((e) => !seen.has(e.id));
+            for (const e of emails) seen.set(e.id, e);
+            if (fresh.length) send({ type: "emails", emails: fresh });
+          },
         });
 
-        for await (const event of claude) {
-          if (event.type !== "content_block_delta") continue;
-          if (event.delta.type === "text_delta") send({ type: "text", text: event.delta.text });
-          else if (event.delta.type === "citations_delta" && event.delta.citation.type === "char_location") {
-            send({ type: "citation", documentIndex: event.delta.citation.document_index, citedText: event.delta.citation.cited_text });
+        const client = new Anthropic();
+        const runner = client.beta.messages.toolRunner({
+          model: MODEL,
+          max_tokens: 8000,
+          system: systemPrompt(all.map((a) => a.email), scope),
+          messages: messages.map((m) => ({ role: m.role, content: m.content })),
+          tools,
+          max_iterations: MAX_ITERATIONS,
+          output_config: { effort: "medium" },
+          betas: ["server-side-fallback-2026-07-01"],
+          fallbacks: "default",
+          stream: true,
+        });
+
+        let textBlocks = 0;
+        for await (const messageStream of runner) {
+          for await (const event of messageStream) {
+            // Text before a tool call and text after it arrive as separate blocks; keep them on separate lines.
+            if (event.type === "content_block_start" && event.content_block.type === "text") {
+              if (textBlocks++ > 0) send({ type: "text", text: "\n\n" });
+              continue;
+            }
+            if (event.type !== "content_block_delta") continue;
+            if (event.delta.type === "text_delta") send({ type: "text", text: event.delta.text });
+            else if (event.delta.type === "citations_delta" && event.delta.citation.type === "search_result_location") {
+              const messageId = parseEmailSource(event.delta.citation.source);
+              if (messageId !== null) send({ type: "citation", messageId });
+            }
+          }
+          const message = await messageStream.finalMessage();
+          for (const block of message.content) {
+            if (block.type === "tool_use") send({ type: "tool_call", name: block.name, input: block.input });
+          }
+          if (message.stop_reason === "refusal") {
+            send({ type: "text", text: "\n\n(The model declined to answer this question.)" });
+            break;
+          }
+          if (message.stop_reason === "max_tokens") {
+            send({ type: "error", error: "The answer was cut off (max_tokens). Try a narrower question." });
+            break;
           }
         }
-        const final = await claude.finalMessage();
-        if (final.stop_reason === "refusal") send({ type: "text", text: "\n\n(The model declined to answer this question.)" });
         send({ type: "done" });
       } catch (err) {
         const msg = err instanceof Anthropic.AuthenticationError
-          ? "Anthropic API key missing or invalid. Set ANTHROPIC_API_KEY in .env.local."
+          ? "Anthropic API key invalid. Check ANTHROPIC_API_KEY in .env.local."
           : (err as Error)?.message ?? String(err);
         send({ type: "error", error: msg });
       } finally {
