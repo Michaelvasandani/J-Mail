@@ -1,0 +1,17 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: jmail-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: jmail
+      POSTGRES_PASSWORD: jmail
+      POSTGRES_DB: jmail
+    ports:
+      - "5433:5432"
+    volumes:
+      - jmail-pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+
+volumes:
+  jmail-pgdata:
